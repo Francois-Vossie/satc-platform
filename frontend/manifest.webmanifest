@@ -1,0 +1,9 @@
+{
+  "name": "Savanna Artisan Trading Cooperative",
+  "short_name": "SATC",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6efe4",
+  "theme_color": "#8a4b1f",
+  "icons": []
+}

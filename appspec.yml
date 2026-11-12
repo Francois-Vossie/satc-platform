@@ -1,0 +1,30 @@
+# CodeDeploy application specification (EC2 / Auto Scaling group)
+version: 0.0
+os: linux
+files:
+  - source: app/web
+    destination: /opt/satc
+  - source: deploy/app.env
+    destination: /opt/satc
+file_exists_behavior: OVERWRITE
+permissions:
+  - object: /opt/satc
+    owner: satc
+    group: satc
+hooks:
+  ApplicationStop:
+    - location: deploy/scripts/stop.sh
+      timeout: 60
+      runas: root
+  AfterInstall:
+    - location: deploy/scripts/after_install.sh
+      timeout: 300
+      runas: root
+  ApplicationStart:
+    - location: deploy/scripts/start.sh
+      timeout: 60
+      runas: root
+  ValidateService:
+    - location: deploy/scripts/validate.sh
+      timeout: 120
+      runas: root

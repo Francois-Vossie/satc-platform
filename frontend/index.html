@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Savanna Artisan Trading Cooperative</title>
+  <meta name="description" content="Handcrafted pottery, textiles, leather, wood carvings, skincare and jewellery from 127 artisans across Southern Africa.">
+  <meta name="theme-color" content="#8a4b1f">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <style>
+    :root { --clay:#8a4b1f; --sand:#f6efe4; --ink:#2b2118; }
+    * { box-sizing:border-box } body { margin:0; font-family:system-ui,sans-serif; background:var(--sand); color:var(--ink) }
+    header { background:var(--clay); color:#fff; padding:1rem 1.25rem } header h1 { margin:0; font-size:1.3rem }
+    nav { display:flex; gap:.5rem; flex-wrap:wrap; padding:.75rem 1.25rem }
+    nav button { border:1px solid var(--clay); background:#fff; color:var(--clay); border-radius:999px; padding:.35rem .9rem; cursor:pointer }
+    nav button.on { background:var(--clay); color:#fff }
+    main { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:1rem; padding:1.25rem }
+    .card { background:#fff; border-radius:12px; padding:1rem; box-shadow:0 1px 3px #0002 }
+    .card h3 { margin:.2rem 0 .4rem; font-size:1rem } .price { font-weight:700; color:var(--clay) }
+    #status { padding:0 1.25rem; font-size:.85rem; color:#6b5a48 }
+  </style>
+</head>
+<body>
+  <header><h1>Savanna Artisan Trading Cooperative</h1><div>Handmade in Botswana, South Africa, Zimbabwe and Namibia</div></header>
+  <nav id="cats"></nav>
+  <p id="status">Loading catalogue...</p>
+  <main id="grid"></main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

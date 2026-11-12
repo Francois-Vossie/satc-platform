@@ -1,0 +1,55 @@
+# CodeBuild build specification - SATC platform
+version: 0.2
+
+env:
+  variables:
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      # Use a Python build that includes sqlite3 (needed by pytest-cov). Some newer pyenv builds on the
+      # image (3.14) lack the _sqlite3 module, so pin the newest installed 3.12/3.13 explicitly.
+      - PYV=$(pyenv versions --bare 2>/dev/null | grep -E '^3\.(12|13)\.' | sort -V | tail -1); if [ -n "$PYV" ]; then pyenv global "$PYV"; fi
+      - python --version
+      - python -c "import sqlite3; print('sqlite3 OK')"
+      - python -m pip install -r requirements-dev.txt
+      - pyenv rehash || true
+  pre_build:
+    commands:
+      - echo "Code quality and security checks"
+      - python -m flake8 --max-line-length 130 app tests                 # style / static analysis
+      - python -m bandit -r app -ll                                      # Python security scan (fails on medium+)
+      - cfn-lint cloudformation/*.yaml                         # infrastructure-as-code validation
+  build:
+    commands:
+      - echo "Unit tests"
+      - python -m pytest --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml --cov-fail-under=80
+  post_build:
+    commands:
+      - echo "Packaging CodeDeploy bundle (build ${CODEBUILD_BUILD_NUMBER})"
+      - echo "APP_VERSION=1.${CODEBUILD_BUILD_NUMBER}.0" > deploy/app.env
+
+reports:
+  satc-unit-tests:
+    files: [junit.xml]
+    base-directory: reports
+    file-format: JUNITXML
+  satc-coverage:
+    files: [coverage.xml]
+    base-directory: reports
+    file-format: COBERTURAXML
+
+artifacts:
+  files:
+    - appspec.yml
+    - deploy/**/*
+    - app/web/**/*
+    - cloudformation/**/*          # templates + parameter files for the CloudFormation deploy stage
+  discard-paths: no
+
+cache:
+  paths:
+    - /root/.cache/pip/**/*

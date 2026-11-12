@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SATC e-commerce platform - Stack 3 of 7: data tier. S3 media bucket (versioned, SSE-KMS, lifecycle),
+  RDS PostgreSQL Multi-AZ with 35-day automated backups and a read replica, DynamoDB tables for the
+  product catalogue and real-time inventory (PITR), and an optional ElastiCache Redis cluster for sessions.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: satc
+  EnvName:
+    Type: String
+    Default: lab
+    AllowedValues: [lab, staging, prod]
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t4g.micro, db.t3.small, db.t4g.small, db.t3.medium]
+  DbEngineVersion:
+    Type: String
+    Default: "16"
+    Description: Major version; RDS selects the current default minor version.
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+  MultiAZ:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Multi-AZ doubles the instance price and is not supported in the AWS Academy Learner Lab.
+  BackupRetentionDays:
+    Type: Number
+    Default: 35
+    MinValue: 1
+    MaxValue: 35
+  CreateReadReplica:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  CreateRedis:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: cache.t3.micro ElastiCache Redis node for session storage (optional in the lab).
+  EnableEnhancedMonitoring:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Requires the RDSRole from the security stack (not available in the Learner Lab).
+
+Conditions:
+  IsMultiAZ: !Equals [!Ref MultiAZ, "true"]
+  HasReplica: !Equals [!Ref CreateReadReplica, "true"]
+  HasRedis: !Equals [!Ref CreateRedis, "true"]
+  HasEnhancedMonitoring: !Equals [!Ref EnableEnhancedMonitoring, "true"]
+
+Resources:
+  # ================================================================ S3 - product images and documents
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvName}-media-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"
+              KMSMasterKeyID: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-KmsKeyArn" }
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: tier-old-versions
+            Status: Enabled
+            NoncurrentVersionTransitions:
+              - { StorageClass: STANDARD_IA, TransitionInDays: 30 }
+              - { StorageClass: GLACIER_IR, TransitionInDays: 90 }
+            NoncurrentVersionExpiration: { NoncurrentDays: 365 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+          - Id: archive-raw-uploads
+            Status: Enabled
+            Prefix: raw-uploads/
+            Transitions:
+              - { StorageClass: INTELLIGENT_TIERING, TransitionInDays: 30 }
+      Tags:
+        - { Key: DataClassification, Value: internal }
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt MediaBucket.Arn, !Sub "${MediaBucket.Arn}/*"]
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+          - Sid: DenyOtherAccounts
+            # data residency/sovereignty: no principal outside this account may read or write SATC data
+            Effect: Deny
+            Principal: "*"
+            Action: ["s3:GetObject", "s3:PutObject"]
+            Resource: !Sub "${MediaBucket.Arn}/*"
+            Condition:
+              StringNotEquals: { "aws:PrincipalAccount": !Ref AWS::AccountId }
+              Bool: { "aws:PrincipalIsAWSService": "false" }
+          - Sid: DenyUnencryptedUploads
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${MediaBucket.Arn}/*"
+            Condition:
+              StringNotEqualsIfExists: { "s3:x-amz-server-side-encryption": "aws:kms" }
+              "Null": { "s3:x-amz-server-side-encryption": "false" }
+
+  RecordsBucket:
+    # invoices, signed artisan agreements and DPIA records. No lifecycle rules: S3 does not allow
+    # lifecycle configuration on a bucket with MFA delete, which the root user enables after deployment:
+    #   aws s3api put-bucket-versioning --bucket <name> --versioning-configuration Status=Enabled,MFADelete=Enabled \
+    #       --mfa "arn:aws:iam::<account>:mfa/root-account-mfa-device <code>"
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvName}-records-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"
+              KMSMasterKeyID: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-KmsKeyArn" }
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      Tags:
+        - { Key: DataClassification, Value: confidential }
+
+  # ================================================================ RDS PostgreSQL (orders, customers, payments)
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private data subnets in two AZs
+      SubnetIds: !Split [",", !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-DataSubnetIds" }]
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: SATC PostgreSQL 16 - TLS enforced, slow-query logging, pg_stat_statements
+      Family: postgres16
+      Parameters:
+        rds.force_ssl: "1"
+        log_min_duration_statement: "500"
+        shared_preload_libraries: pg_stat_statements
+        log_connections: "1"
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${EnvName}-pg"
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-KmsKeyArn" }
+      DBName: satc
+      MasterUsername: satc_admin
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        KmsKeyId: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-KmsKeyArn" }
+      MultiAZ: !If [IsMultiAZ, true, false]
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DBParameterGroupName: !Ref DbParameterGroup
+      VPCSecurityGroups: [!ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-DbSgId" }]
+      PubliclyAccessible: false
+      Port: "5432"
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      PreferredBackupWindow: "00:00-01:00"
+      PreferredMaintenanceWindow: "sun:02:00-sun:03:00"
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      EnableCloudwatchLogsExports: [postgresql]
+      MonitoringInterval: !If [HasEnhancedMonitoring, 60, 0]
+      MonitoringRoleArn: !If [HasEnhancedMonitoring, !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-RdsRoleArn" }, !Ref AWS::NoValue]
+      DeletionProtection: false
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${EnvName}-pg" }
+        - { Key: Backup, Value: daily }
+  ReadReplica:
+    Type: AWS::RDS::DBInstance
+    Condition: HasReplica
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${EnvName}-pg-replica"
+      SourceDBInstanceIdentifier: !Ref Database
+      DBInstanceClass: !Ref DbInstanceClass
+      # A same-Region replica inherits encryption and the KMS key from the encrypted source instance,
+      # so StorageEncrypted and KmsKeyId are not set here (they are only used for cross-Region replicas).
+      PubliclyAccessible: false
+      VPCSecurityGroups: [!ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-DbSgId" }]
+      DBParameterGroupName: !Ref DbParameterGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${EnvName}-pg-replica" }
+        - { Key: Purpose, Value: reporting-and-dashboards }
+
+  # ================================================================ DynamoDB (catalogue + real-time inventory)
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${ProjectName}-${EnvName}-products"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: productId, AttributeType: S }
+        - { AttributeName: category, AttributeType: S }
+      KeySchema:
+        - { AttributeName: productId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: category-index
+          KeySchema:
+            - { AttributeName: category, KeyType: HASH }
+            - { AttributeName: productId, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-KmsKeyArn" }
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${ProjectName}-${EnvName}-inventory"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: sku, AttributeType: S }
+      KeySchema:
+        - { AttributeName: sku, KeyType: HASH }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-KmsKeyArn" }
+
+  # ================================================================ ElastiCache Redis (sessions, catalogue and API response cache)
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Condition: HasRedis
+    Properties:
+      Description: Private data subnets
+      SubnetIds: !Split [",", !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-DataSubnetIds" }]
+  RedisCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: HasRedis
+    Properties:
+      ReplicationGroupDescription: SATC sessions (TTL 3600 s) and catalogue cache
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheClusters: 1
+      AutomaticFailoverEnabled: false
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds: [!ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-CacheSgId" }]
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      KmsKeyId: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-KmsKeyArn" }
+
+Outputs:
+  MediaBucketName:
+    Value: !Ref MediaBucket
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-MediaBucket" }
+  RecordsBucketName:
+    Value: !Ref RecordsBucket
+  DbEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-DbEndpoint" }
+  DbInstanceId:
+    Value: !Ref Database
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-DbInstanceId" }
+  DbSecretArn:
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-DbSecretArn" }
+  ReadReplicaEndpoint:
+    Condition: HasReplica
+    Value: !GetAtt ReadReplica.Endpoint.Address
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-DbReplicaEndpoint" }
+  ProductsTableName:
+    Value: !Ref ProductsTable
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-ProductsTable" }
+  InventoryTableName:
+    Value: !Ref InventoryTable
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-InventoryTable" }
+  RedisEndpoint:
+    Condition: HasRedis
+    Value: !GetAtt RedisCluster.PrimaryEndPoint.Address
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-RedisEndpoint" }

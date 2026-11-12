@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SATC e-commerce platform - Stack 5 of 7: edge and frontend. Private S3 bucket for the React PWA
+  (versioned, SSE-KMS) served only through CloudFront Origin Access Control; CloudFront distribution with
+  S3, ALB and API Gateway origins, HTTPS-only viewers, compression, 24 h default TTL, Origin Shield,
+  security headers and (in us-east-1) a CLOUDFRONT-scope WAF web ACL.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: satc
+  EnvName:
+    Type: String
+    Default: lab
+    AllowedValues: [lab, staging, prod]
+  OriginShieldRegion:
+    Type: String
+    Default: us-east-1
+    Description: Origin Shield location closest to the origin region (use eu-west-1 or the nearest supported Region for af-south-1).
+  PriceClass:
+    Type: String
+    Default: PriceClass_All
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: PriceClass_All includes the Johannesburg and Cape Town edge locations used by SATC's local customers.
+
+Conditions:
+  InUsEast1: !Equals [!Ref "AWS::Region", us-east-1]
+
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvName}-site-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"
+              KMSMasterKeyID: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-KmsKeyArn" }
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-builds
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-${EnvName}-site-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: InUsEast1
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvName}-cloudfront-acl"
+      Scope: CLOUDFRONT
+      DefaultAction: { Allow: {} }
+      VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: !Sub "${ProjectName}${EnvName}CfAcl" }
+      Rules:
+        - Name: RateLimitPerIp
+          Priority: 0
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement: { Limit: 2000, EvaluationWindowSec: 300, AggregateKeyType: IP }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: CfRateLimit }
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement: { ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesAmazonIpReputationList } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: CfIpReputation }
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement: { ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesCommonRuleSet } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: CfCommon }
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction: { None: {} }
+          Statement: { ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesSQLiRuleSet } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: CfSqli }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${ProjectName}-${EnvName} storefront"
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        DefaultRootObject: index.html
+        WebACLId: !If [InUsEast1, !GetAtt CloudFrontWebAcl.Arn, !Ref AWS::NoValue]
+        Origins:
+          - Id: s3-site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+            OriginShield: { Enabled: true, OriginShieldRegion: !Ref OriginShieldRegion }
+          - Id: alb-app
+            DomainName: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-AlbDnsName" }
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only      # use https-only once an ACM certificate is on the ALB
+              HTTPPort: 80
+              OriginSSLProtocols: [TLSv1.2]
+          - Id: api
+            DomainName: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-ApiDomain" }
+            OriginPath: /prod
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: s3-site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6          # Managed-CachingOptimized (default TTL 86400 s)
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy (HSTS, X-Frame-Options...)
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            Compress: true
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+          - PathPattern: /app/*
+            TargetOriginId: alb-app
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # Managed-AllViewer
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 10 }   # SPA client-side routes
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 10 }
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true   # *.cloudfront.net; viewers negotiate TLS 1.3 where supported
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOacRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt SiteBucket.Arn, !Sub "${SiteBucket.Arn}/*"]
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+Outputs:
+  SiteBucketName:
+    Value: !Ref SiteBucket
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-SiteBucket" }
+  DistributionId:
+    Value: !Ref Distribution
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-DistributionId" }
+  StorefrontUrl:
+    Value: !Sub "https://${Distribution.DomainName}"
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-StorefrontUrl" }

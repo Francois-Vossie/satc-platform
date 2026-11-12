@@ -1,0 +1,379 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SATC e-commerce platform - Stack 6 of 7: monitoring, observability and cost control. SNS alert topic,
+  CloudWatch alarms (CPU, memory, disk, latency > 1 s, error rate > 1 %, RDS CPU > 80 %, DLQ messages),
+  KPI dashboard, CloudWatch Logs Insights saved queries and an AWS Budget alert at USD 150 per month.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: satc
+  EnvName:
+    Type: String
+    Default: lab
+    AllowedValues: [lab, staging, prod]
+  AlertEmail:
+    Type: String
+    Description: Address that receives alarm and budget notifications (confirm the SNS subscription email).
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 150
+
+Conditions:
+  # AWS::Budgets::Budget is only offered by CloudFormation in some Regions (not eu-north-1).
+  # Elsewhere the budget is created once per account in the Billing console instead.
+  CanCreateBudget: !Equals [!Ref "AWS::Region", us-east-1]
+
+Resources:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${EnvName}-alerts"
+      Subscription: [{ Protocol: email, Endpoint: !Ref AlertEmail }]
+      KmsMasterKeyId: alias/aws/sns
+
+  # ================================================================ compute alarms
+  Ec2CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-ec2-cpu-above-80"
+      AlarmDescription: Average CPU of the web ASG above 80 % for 5 minutes (scaling starts at 70 %)
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: AutoScalingGroupName, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-AsgName" } }]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  Ec2MemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-ec2-memory-above-80"
+      AlarmDescription: Memory used (CloudWatch agent custom metric) above 80 %
+      Namespace: CWAgent
+      MetricName: mem_used_percent
+      Dimensions: [{ Name: AutoScalingGroupName, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-AsgName" } }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  Ec2DiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-ec2-disk-above-80"
+      AlarmDescription: Root volume used (CloudWatch agent custom metric) above 80 %
+      Namespace: CWAgent
+      MetricName: disk_used_percent
+      Dimensions: [{ Name: AutoScalingGroupName, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-AsgName" } }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # ================================================================ application alarms
+  AlbLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-alb-latency-above-1s"
+      AlarmDescription: p90 target response time above 1 second in 3 of 5 minutes
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions: [{ Name: LoadBalancer, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-AlbFullName" } }]
+      ExtendedStatistic: p90
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  AlbErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-alb-5xx-rate-above-1pct"
+      AlarmDescription: (target 5xx + ALB 5xx) / requests above 1 %
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      Metrics:
+        - Id: errorRate
+          Expression: "IF(requests > 0, 100 * (t5xx + e5xx) / requests, 0)"
+          Label: 5xx error rate (%)
+          ReturnData: true
+        - Id: t5xx
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_Target_5XX_Count
+              Dimensions: [{ Name: LoadBalancer, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-AlbFullName" } }]
+            Period: 60
+            Stat: Sum
+        - Id: e5xx
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_ELB_5XX_Count
+              Dimensions: [{ Name: LoadBalancer, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-AlbFullName" } }]
+            Period: 60
+            Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: RequestCount
+              Dimensions: [{ Name: LoadBalancer, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-AlbFullName" } }]
+            Period: 60
+            Stat: Sum
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-api-latency-above-1s"
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - { Name: ApiName, Value: !Sub "${ProjectName}-${EnvName}-api" }
+        - { Name: Stage, Value: prod }
+      ExtendedStatistic: p90
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  ApiErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-api-5xx-rate-above-1pct"
+      AlarmDescription: API Gateway 5XXError average (fraction of requests) above 0.01
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - { Name: ApiName, Value: !Sub "${ProjectName}-${EnvName}-api" }
+        - { Name: Stage, Value: prod }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 0.01
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  OrdersErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-orders-lambda-errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-OrdersFunction" } }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-dlq-has-messages"
+      AlarmDescription: At least one failed order event is waiting in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-DlqName" } }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # ================================================================ database alarms
+  RdsCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-rds-cpu-above-80"
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-DbInstanceId" } }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+  RdsStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-rds-free-storage-below-2gb"
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-DbInstanceId" } }]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+
+  # ================================================================ dashboard (KPIs)
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-${EnvName}-kpis"
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              { "type": "text", "x": 0, "y": 0, "width": 24, "height": 1,
+                "properties": { "markdown": "## SATC platform KPIs (${EnvName}) - latency, errors, capacity, database, orders, cost" } },
+              { "type": "metric", "x": 0, "y": 1, "width": 8, "height": 6,
+                "properties": { "title": "Latency p50 / p90 (s)", "region": "${AWS::Region}", "view": "timeSeries",
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${Alb}", { "stat": "p50" } ],
+                    [ "...", { "stat": "p90" } ] ],
+                  "annotations": { "horizontal": [ { "label": "SLO 1 s", "value": 1 } ] } } },
+              { "type": "metric", "x": 8, "y": 1, "width": 8, "height": 6,
+                "properties": { "title": "Requests and 5xx errors", "region": "${AWS::Region}", "stat": "Sum",
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${Alb}" ],
+                    [ ".", "HTTPCode_Target_5XX_Count", ".", "." ],
+                    [ "AWS/ApiGateway", "5XXError", "ApiName", "${ProjectName}-${EnvName}-api", "Stage", "prod" ],
+                    [ ".", "4XXError", ".", ".", ".", "." ] ] } },
+              { "type": "metric", "x": 16, "y": 1, "width": 8, "height": 6,
+                "properties": { "title": "EC2 CPU / memory / disk (%)", "region": "${AWS::Region}", "stat": "Average",
+                  "metrics": [
+                    [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${Asg}" ],
+                    [ "CWAgent", "mem_used_percent", "AutoScalingGroupName", "${Asg}" ],
+                    [ "CWAgent", "disk_used_percent", "AutoScalingGroupName", "${Asg}" ] ],
+                  "annotations": { "horizontal": [ { "label": "Scale-out 70 %", "value": 70 } ] } } },
+              { "type": "metric", "x": 0, "y": 7, "width": 8, "height": 6,
+                "properties": { "title": "Instances in service", "region": "${AWS::Region}", "stat": "Average",
+                  "metrics": [ [ "AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${Asg}" ] ] } },
+              { "type": "metric", "x": 8, "y": 7, "width": 8, "height": 6,
+                "properties": { "title": "RDS CPU, connections, read latency", "region": "${AWS::Region}",
+                  "metrics": [
+                    [ "AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${Db}" ],
+                    [ ".", "DatabaseConnections", ".", "." ],
+                    [ ".", "ReadLatency", ".", ".", { "yAxis": "right" } ],
+                    [ ".", "WriteLatency", ".", ".", { "yAxis": "right" } ] ] } },
+              { "type": "metric", "x": 16, "y": 7, "width": 8, "height": 6,
+                "properties": { "title": "Orders Lambda: invocations, errors, duration p90", "region": "${AWS::Region}",
+                  "metrics": [
+                    [ "AWS/Lambda", "Invocations", "FunctionName", "${Orders}", { "stat": "Sum" } ],
+                    [ ".", "Errors", ".", ".", { "stat": "Sum" } ],
+                    [ ".", "Duration", ".", ".", { "stat": "p90", "yAxis": "right" } ],
+                    [ "SATC/${EnvName}", "OrdersPlaced", "Service", "orders", { "stat": "Sum" } ] ] } },
+              { "type": "metric", "x": 0, "y": 13, "width": 8, "height": 6,
+                "properties": { "title": "WAF blocked vs allowed", "region": "${AWS::Region}", "stat": "Sum",
+                  "metrics": [
+                    [ "AWS/WAFV2", "BlockedRequests", "WebACL", "${ProjectName}-${EnvName}-regional-acl", "Region", "${AWS::Region}", "Rule", "ALL" ],
+                    [ ".", "AllowedRequests", ".", ".", ".", ".", ".", "." ] ] } },
+              { "type": "metric", "x": 8, "y": 13, "width": 8, "height": 6,
+                "properties": { "title": "Dead-letter queue depth", "region": "${AWS::Region}", "stat": "Maximum",
+                  "metrics": [ [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${Dlq}" ] ] } },
+              { "type": "metric", "x": 16, "y": 13, "width": 8, "height": 6,
+                "properties": { "title": "Estimated charges (USD, us-east-1 billing metric)", "region": "us-east-1", "stat": "Maximum", "period": 21600,
+                  "metrics": [ [ "AWS/Billing", "EstimatedCharges", "Currency", "USD" ] ],
+                  "annotations": { "horizontal": [ { "label": "Budget", "value": ${MonthlyBudgetUsd} } ] } } }
+            ]
+          }
+        - Alb: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-AlbFullName" }
+          Asg: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-AsgName" }
+          Db: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-DbInstanceId" }
+          Orders: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-OrdersFunction" }
+          Dlq: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-DlqName" }
+
+  # ================================================================ Logs Insights saved queries
+  QueryLambdaErrors:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${ProjectName}/${EnvName}/lambda-errors"
+      LogGroupNames:
+        - !Sub "/aws/lambda/${ProjectName}-${EnvName}-orders"
+        - !Sub "/aws/lambda/${ProjectName}-${EnvName}-products"
+      QueryString: |
+        fields @timestamp, @logStream, @message
+        | filter @message like /ERROR|Task timed out|Exception/
+        | sort @timestamp desc
+        | limit 50
+  QueryColdStarts:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${ProjectName}/${EnvName}/lambda-cold-starts"
+      LogGroupNames:
+        - !Sub "/aws/lambda/${ProjectName}-${EnvName}-orders"
+        - !Sub "/aws/lambda/${ProjectName}-${EnvName}-products"
+      QueryString: |
+        filter @type = "REPORT"
+        | stats count(*) as invocations, count(@initDuration) as coldStarts,
+                avg(@initDuration) as avgInitMs, max(@initDuration) as maxInitMs,
+                pct(@duration, 90) as p90DurationMs by bin(1h)
+  QuerySlowApiRequests:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${ProjectName}/${EnvName}/slow-api-requests"
+      LogGroupNames: [!Sub "/${ProjectName}/${EnvName}/apigw/access"]
+      QueryString: |
+        fields @timestamp, method, path, status, latencyMs, integrationLatencyMs
+        | filter latencyMs > 1000 or status >= 500
+        | sort latencyMs desc
+        | limit 100
+  QueryWafBlocks:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${ProjectName}/${EnvName}/waf-blocked-requests"
+      LogGroupNames: [!Sub "aws-waf-logs-${ProjectName}-${EnvName}"]
+      QueryString: |
+        fields @timestamp, httpRequest.clientIp, httpRequest.uri, terminatingRuleId
+        | filter action = "BLOCK"
+        | stats count(*) as blocked by terminatingRuleId, httpRequest.clientIp
+        | sort blocked desc
+
+  # ================================================================ cost guardrail
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: CanCreateBudget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-${EnvName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+
+Outputs:
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-AlertTopicArn" }
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvName}-kpis"
+  AlbErrorAlarmName:
+    Value: !Ref AlbErrorRateAlarm
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-AlbErrorAlarm" }
+  AlbLatencyAlarmName:
+    Value: !Ref AlbLatencyAlarm
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-AlbLatencyAlarm" }

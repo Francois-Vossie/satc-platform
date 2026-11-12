@@ -1,0 +1,605 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SATC e-commerce platform - Stack 2 of 7: security and compliance. KMS customer managed key,
+  security groups (ALB, app, Lambda, DB, cache), least-privilege IAM roles (EC2Role, LambdaRole, RDSRole),
+  MFA-enforced admin group, data-residency guardrail, Cognito user pool, regional WAF web ACL,
+  CloudTrail audit trail and (optionally) AWS Config managed rules.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: satc
+  EnvName:
+    Type: String
+    Default: lab
+    AllowedValues: [lab, staging, prod]
+  AdminCidr:
+    Type: String
+    Default: 172.16.0.0/24
+    Description: Head-office network reached over the site-to-site VPN; the only source allowed SSH (22) to EC2.
+  CreateIamRoles:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set to false in the AWS Academy Learner Lab, where you cannot create IAM roles. The stacks then use
+      the pre-created LabRole and LabInstanceProfile instead.
+  TrailMultiRegion:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Multi-Region trails are not available on AWS Free Plan accounts; set true on a paid account.
+  EnableConfigRules:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Requires the AWS Config recorder to be switched on first (Config console, 1-click setup).
+  AllowedRegions:
+    Type: CommaDelimitedList
+    Default: "af-south-1,eu-west-1,us-east-1"
+    Description: Regions where SATC data may be stored (POPIA/GDPR residency guardrail). us-east-1 is needed for global services.
+
+Conditions:
+  CreateRoles: !Equals [!Ref CreateIamRoles, "true"]
+  UseLabRole: !Equals [!Ref CreateIamRoles, "false"]
+  MultiRegionTrail: !Equals [!Ref TrailMultiRegion, "true"]
+  ConfigRules: !Equals [!Ref EnableConfigRules, "true"]
+
+Resources:
+  # ================================================================ KMS (AES-256 CMK, annual rotation)
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "${ProjectName}-${EnvName} data key for S3, RDS, DynamoDB, Secrets Manager and CloudTrail"
+      EnableKeyRotation: true
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: CloudTrailEncryptLogs
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: "kms:GenerateDataKey*"
+            Resource: "*"
+            Condition:
+              StringLike:
+                "kms:EncryptionContext:aws:cloudtrail:arn": !Sub "arn:aws:cloudtrail:*:${AWS::AccountId}:trail/*"
+          - Sid: CloudTrailDescribeKey
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: "kms:DescribeKey"
+            Resource: "*"
+          - Sid: CloudFrontOacReadEncryptedObjects
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey*"]
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+  KmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-${EnvName}-data"
+      TargetKeyId: !Ref KmsKey
+
+  # ================================================================ security groups (stateful)
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP/HTTPS from the internet (CloudFront)
+      VpcId: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP (redirected to HTTPS) }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS }
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${EnvName}-sg-alb" }
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 application tier - HTTP from ALB only, SSH from admin VPN only
+      VpcId: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref AlbSecurityGroup, Description: App traffic from ALB }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref AdminCidr, Description: SSH from head office VPN }
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-VpcCidr" }
+          Description: ICMP echo inside the VPC (connectivity testing)
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS to AWS APIs and partners }
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-VpcCidr" }
+          Description: ICMP echo inside the VPC (connectivity testing)
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: OS package repositories }
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${EnvName}-sg-app" }
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda ENIs - no inbound, outbound to DB and HTTPS only
+      VpcId: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-VpcId" }
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS to AWS APIs and payment partners }
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${EnvName}-sg-lambda" }
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL - 5432 from Lambda (application) and EC2 (admin psql via SSM) only
+      VpcId: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref AppSecurityGroup, Description: Admin psql from EC2 via Session Manager }
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref LambdaSecurityGroup, Description: PostgreSQL from Lambda }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 127.0.0.1/32, Description: No outbound traffic }
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${EnvName}-sg-db" }
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ElastiCache Redis - 6379 from app tier only
+      VpcId: !ImportValue { "Fn::Sub": "${ProjectName}-${EnvName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 6379, ToPort: 6379, SourceSecurityGroupId: !Ref AppSecurityGroup, Description: Redis from EC2 }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 127.0.0.1/32, Description: No outbound traffic }
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${EnvName}-sg-cache" }
+  # egress rules added separately to avoid a circular reference between groups
+  AppToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+      Description: PostgreSQL to RDS
+  AppToCacheEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !Ref CacheSecurityGroup
+      Description: Redis
+  LambdaToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+      Description: PostgreSQL to RDS
+  AlbToAppEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      DestinationSecurityGroupId: !Ref AppSecurityGroup
+      Description: Forward to app instances
+
+  # ================================================================ IAM roles (least privilege)
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvName}-EC2Role"
+      Description: EC2 app instances - CloudWatch agent, SSM, app bundle download, catalogue reads, admin DB access
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: app-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadAppBundles
+                # web app code at boot (packages bucket) and CodeDeploy revisions (artifacts bucket)
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:ListBucket"]
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-${EnvName}-packages-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-${EnvName}-packages-${AWS::AccountId}/web/*"
+                  - !Sub "arn:aws:s3:::${ProjectName}-${EnvName}-artifacts-${AWS::AccountId}/*"
+                  - !Sub "arn:aws:s3:::aws-codedeploy-${AWS::Region}/*"
+              - Sid: ReadCatalogue
+                Effect: Allow
+                Action: dynamodb:Scan
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${EnvName}-products"
+              - Sid: AdminDatabaseAccess
+                # schema migrations and test queries are run with psql from an instance via Session Manager
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:rds!*"
+              - Sid: UseDataKey
+                Effect: Allow
+                Action: ["kms:Decrypt", "kms:GenerateDataKey"]
+                Resource: !GetAtt KmsKey.Arn
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: CreateRoles
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-${EnvName}-EC2InstanceProfile"
+      Roles: [!Ref Ec2Role]
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvName}-LambdaRole"
+      Description: Order and inventory functions - DynamoDB, S3, CloudWatch, X-Ray, DLQ
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: lambda-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CatalogueReads
+                # products function: GetItem, Scan, Query on category-index
+                Effect: Allow
+                Action: ["dynamodb:GetItem", "dynamodb:Scan", "dynamodb:Query"]
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${EnvName}-products"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${EnvName}-products/index/category-index"
+              - Sid: StockReservation
+                # orders function: BatchGetItem for prices, UpdateItem inside TransactWriteItems
+                Effect: Allow
+                Action: ["dynamodb:BatchGetItem", "dynamodb:UpdateItem"]
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${EnvName}-inventory"
+              - Sid: DeadLetterQueue
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${EnvName}-*"
+              - Sid: DbCredentials
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:rds!*"
+              - Sid: UseDataKey
+                Effect: Allow
+                Action: ["kms:Decrypt", "kms:GenerateDataKey"]
+                Resource: !GetAtt KmsKey.Arn
+
+  RdsRole:
+    # RDSRole: enhanced monitoring plus use of the CMK (for S3 export of snapshots to the DR bucket)
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvName}-RDSRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [monitoring.rds.amazonaws.com, export.rds.amazonaws.com] }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Policies:
+        - PolicyName: rds-kms-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey", "kms:CreateGrant"]
+                Resource: !GetAtt KmsKey.Arn
+
+  # MFA enforcement for privileged (human) operators
+  AdminGroup:
+    Type: AWS::IAM::Group
+    Condition: CreateRoles
+    Properties:
+      GroupName: !Sub "${ProjectName}-${EnvName}-Admins"
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/PowerUserAccess]
+      Policies:
+        - PolicyName: deny-without-mfa
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DenyAllExceptMfaSetupWithoutMfa
+                Effect: Deny
+                NotAction: ["iam:CreateVirtualMFADevice", "iam:EnableMFADevice", "iam:GetUser",
+                            "iam:ListMFADevices", "iam:ListVirtualMFADevices", "iam:ResyncMFADevice",
+                            "sts:GetSessionToken", "iam:ChangePassword"]
+                Resource: "*"
+                Condition:
+                  BoolIfExists: { "aws:MultiFactorAuthPresent": "false" }
+        - PolicyName: data-residency-guardrail
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DenyOutsideApprovedRegions
+                Effect: Deny
+                NotAction: ["iam:*", "sts:*", "cloudfront:*", "route53:*", "waf:*", "support:*", "budgets:*", "ce:*"]
+                Resource: "*"
+                Condition:
+                  StringNotEquals: { "aws:RequestedRegion": !Ref AllowedRegions }
+
+  # ================================================================ Cognito (customer and staff identities)
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-${EnvName}-users"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      DeletionProtection: INACTIVE
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 3
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: verified_email, Priority: 1 }]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${ProjectName}-${EnvName}-web"
+      GenerateSecret: false
+      # SRP for the browser; ADMIN_USER_PASSWORD only works with IAM credentials (used to get a test token)
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH, ALLOW_ADMIN_USER_PASSWORD_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: days }
+
+  # ================================================================ WAF (regional - protects the ALB and API Gateway)
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvName}-regional-acl"
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${ProjectName}${EnvName}RegionalAcl"
+      Rules:
+        - Name: RateLimitPerIp
+          Priority: 0
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: RateLimitPerIp }
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesAmazonIpReputationList }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: IpReputation }
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesCommonRuleSet }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: CommonRuleSet }
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesSQLiRuleSet }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: SQLiRuleSet }
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 4
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: KnownBadInputs }
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "aws-waf-logs-${ProjectName}-${EnvName}"
+      RetentionInDays: 30
+  WafLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WafLogGroup}"
+      RedactedFields:
+        - SingleHeader: { Name: authorization }
+
+  # ================================================================ CloudTrail (audit)
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvName}-cloudtrail-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: "aws:kms", KMSMasterKeyID: !GetAtt KmsKey.Arn }
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-then-expire
+            Status: Enabled
+            Transitions:
+              - { StorageClass: STANDARD_IA, TransitionInDays: 30 }
+              - { StorageClass: GLACIER, TransitionInDays: 90 }
+            ExpirationInDays: 400
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+            Condition:
+              StringEquals: { "aws:SourceArn": !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-${EnvName}-trail" }
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": bucket-owner-full-control
+                "aws:SourceArn": !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-${EnvName}-trail"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt TrailBucket.Arn, !Sub "${TrailBucket.Arn}/*"]
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ProjectName}-${EnvName}-trail"
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: !If [MultiRegionTrail, true, false]
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      KMSKeyId: !GetAtt KmsKey.Arn
+
+  # ================================================================ AWS Config managed rules (continuous compliance)
+  CfgS3PublicRead:
+    Type: AWS::Config::ConfigRule
+    Condition: ConfigRules
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-s3-bucket-public-read-prohibited"
+      Source: { Owner: AWS, SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED }
+  CfgS3Tls:
+    Type: AWS::Config::ConfigRule
+    Condition: ConfigRules
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-s3-bucket-ssl-requests-only"
+      Source: { Owner: AWS, SourceIdentifier: S3_BUCKET_SSL_REQUESTS_ONLY }
+  CfgRdsEncrypted:
+    Type: AWS::Config::ConfigRule
+    Condition: ConfigRules
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-rds-storage-encrypted"
+      Source: { Owner: AWS, SourceIdentifier: RDS_STORAGE_ENCRYPTED }
+  CfgRdsMultiAz:
+    Type: AWS::Config::ConfigRule
+    Condition: ConfigRules
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-rds-multi-az-support"
+      Source: { Owner: AWS, SourceIdentifier: RDS_MULTI_AZ_SUPPORT }
+  CfgEbsEncrypted:
+    Type: AWS::Config::ConfigRule
+    Condition: ConfigRules
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-encrypted-volumes"
+      Source: { Owner: AWS, SourceIdentifier: ENCRYPTED_VOLUMES }
+  CfgTrailEnabled:
+    Type: AWS::Config::ConfigRule
+    Condition: ConfigRules
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-cloudtrail-enabled"
+      Source: { Owner: AWS, SourceIdentifier: CLOUD_TRAIL_ENABLED }
+  CfgRestrictedSsh:
+    Type: AWS::Config::ConfigRule
+    Condition: ConfigRules
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-restricted-ssh"
+      Source: { Owner: AWS, SourceIdentifier: INCOMING_SSH_DISABLED }
+  CfgDynamoPitr:
+    Type: AWS::Config::ConfigRule
+    Condition: ConfigRules
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-dynamodb-pitr-enabled"
+      Source: { Owner: AWS, SourceIdentifier: DYNAMODB_PITR_ENABLED }
+  CfgMfaRoot:
+    Type: AWS::Config::ConfigRule
+    Condition: ConfigRules
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-root-account-mfa-enabled"
+      Source: { Owner: AWS, SourceIdentifier: ROOT_ACCOUNT_MFA_ENABLED }
+
+Outputs:
+  KmsKeyArn:
+    Value: !GetAtt KmsKey.Arn
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-KmsKeyArn" }
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-AlbSgId" }
+  AppSecurityGroupId:
+    Value: !Ref AppSecurityGroup
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-AppSgId" }
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-LambdaSgId" }
+  DbSecurityGroupId:
+    Value: !Ref DbSecurityGroup
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-DbSgId" }
+  CacheSecurityGroupId:
+    Value: !Ref CacheSecurityGroup
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-CacheSgId" }
+  Ec2InstanceProfileName:
+    Value: !If [CreateRoles, !Ref Ec2InstanceProfile, LabInstanceProfile]
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-Ec2InstanceProfile" }
+  LambdaRoleArn:
+    Value: !If [CreateRoles, !GetAtt LambdaRole.Arn, !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"]
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-LambdaRoleArn" }
+  RdsRoleArn:
+    Value: !If [CreateRoles, !GetAtt RdsRole.Arn, "none"]
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-RdsRoleArn" }
+  UserPoolId:
+    Value: !Ref UserPool
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-UserPoolId" }
+  UserPoolArn:
+    Value: !GetAtt UserPool.Arn
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-UserPoolArn" }
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-UserPoolClientId" }
+  RegionalWebAclArn:
+    Value: !GetAtt WebAcl.Arn
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-RegionalWebAclArn" }
+  TrailName:
+    Value: !Ref Trail
+  UsingLabRole:
+    Condition: UseLabRole
+    Value: "Learner Lab mode: LabRole / LabInstanceProfile are used instead of custom roles"
